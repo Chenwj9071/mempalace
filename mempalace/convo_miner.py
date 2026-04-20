@@ -1,185 +1,29 @@
 #!/usr/bin/env python3
 """
-convo_miner.py — Mine conversations into the palace.
-
-Ingests chat exports (Claude Code, ChatGPT, Slack, plain text transcripts).
-Normalizes format, chunks by exchange pair (Q+A = one unit), files to palace.
-
-Same palace as project mining. Different ingest strategy.
+convo_miner.py - Mine conversations into the palace.
 """
 
+import hashlib
+import json
 import os
 import sys
-import hashlib
-from pathlib import Path
-from datetime import datetime
 from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
 
-from .normalize import normalize
-from .palace import (
-    NORMALIZE_VERSION,
-    SKIP_DIRS,
-    file_already_mined,
-    get_collection,
-    mine_lock,
-)
+from .normalize import normalize_with_metadata
+from .palace import NORMALIZE_VERSION, SKIP_DIRS, get_collection, mine_lock
 
-
-# Cached hall keywords — avoids re-reading config per drawer
 _HALL_KEYWORDS_CACHE = None
 
-
-def _detect_hall_cached(content: str) -> str:
-    """Route content to a hall using cached keywords. Same logic as miner.detect_hall."""
-    global _HALL_KEYWORDS_CACHE
-    if _HALL_KEYWORDS_CACHE is None:
-        from .config import MempalaceConfig
-
-        _HALL_KEYWORDS_CACHE = MempalaceConfig().hall_keywords
-    content_lower = content[:3000].lower()
-    scores = {}
-    for hall, keywords in _HALL_KEYWORDS_CACHE.items():
-        score = sum(1 for kw in keywords if kw in content_lower)
-        if score > 0:
-            scores[hall] = score
-    return max(scores, key=scores.get) if scores else "general"
-
-
-# File types that might contain conversations
-CONVO_EXTENSIONS = {
-    ".txt",
-    ".md",
-    ".json",
-    ".jsonl",
-}
-
+CONVO_EXTENSIONS = {".txt", ".md", ".json", ".jsonl"}
 MIN_CHUNK_SIZE = 30
-CHUNK_SIZE = 800  # chars per drawer — align with miner.py
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB — skip files larger than this
-
-
-def _register_file(collection, source_file: str, wing: str, agent: str):
-    """Write a sentinel so file_already_mined() returns True for 0-chunk files.
-
-    Without this, files that normalize to nothing or produce zero chunks are
-    re-read and re-processed on every mine run because nothing was written to
-    ChromaDB on the first pass.
-    """
-    sentinel_id = f"_reg_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
-    collection.upsert(
-        documents=[f"[registry] {source_file}"],
-        ids=[sentinel_id],
-        metadatas=[
-            {
-                "wing": wing,
-                "room": "_registry",
-                "source_file": source_file,
-                "added_by": agent,
-                "filed_at": datetime.now().isoformat(),
-                "ingest_mode": "registry",
-                "normalize_version": NORMALIZE_VERSION,
-            }
-        ],
-    )
-
-
-# =============================================================================
-# CHUNKING — exchange pairs for conversations
-# =============================================================================
-
-
-def chunk_exchanges(content: str) -> list:
-    """
-    Chunk by exchange pair: one > turn + AI response = one unit.
-    Falls back to paragraph chunking if no > markers.
-    """
-    lines = content.split("\n")
-    quote_lines = sum(1 for line in lines if line.strip().startswith(">"))
-
-    if quote_lines >= 3:
-        return _chunk_by_exchange(lines)
-    else:
-        return _chunk_by_paragraph(content)
-
-
-def _chunk_by_exchange(lines: list) -> list:
-    """One user turn (>) + the AI response that follows = one or more chunks.
-
-    The full AI response is preserved verbatim.  When the combined
-    user-turn + response exceeds CHUNK_SIZE the response is split across
-    consecutive drawers so nothing is silently discarded.
-    """
-    chunks = []
-    i = 0
-
-    while i < len(lines):
-        line = lines[i]
-        if line.strip().startswith(">"):
-            user_turn = line.strip()
-            i += 1
-
-            ai_lines = []
-            while i < len(lines):
-                next_line = lines[i]
-                if next_line.strip().startswith(">") or next_line.strip().startswith("---"):
-                    break
-                if next_line.strip():
-                    ai_lines.append(next_line.strip())
-                i += 1
-
-            ai_response = " ".join(ai_lines)
-            content = f"{user_turn}\n{ai_response}" if ai_response else user_turn
-
-            # Split into multiple drawers when the exchange exceeds CHUNK_SIZE
-            if len(content) > CHUNK_SIZE:
-                # First chunk: user turn + as much response as fits
-                first_part = content[:CHUNK_SIZE]
-                if len(first_part.strip()) > MIN_CHUNK_SIZE:
-                    chunks.append({"content": first_part, "chunk_index": len(chunks)})
-                # Remaining response in CHUNK_SIZE-sized continuation drawers
-                remainder = content[CHUNK_SIZE:]
-                while remainder:
-                    part = remainder[:CHUNK_SIZE]
-                    remainder = remainder[CHUNK_SIZE:]
-                    if len(part.strip()) > MIN_CHUNK_SIZE:
-                        chunks.append({"content": part, "chunk_index": len(chunks)})
-            elif len(content.strip()) > MIN_CHUNK_SIZE:
-                chunks.append(
-                    {
-                        "content": content,
-                        "chunk_index": len(chunks),
-                    }
-                )
-        else:
-            i += 1
-
-    return chunks
-
-
-def _chunk_by_paragraph(content: str) -> list:
-    """Fallback: chunk by paragraph breaks."""
-    chunks = []
-    paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
-
-    # If no paragraph breaks and long content, chunk by line groups
-    if len(paragraphs) <= 1 and content.count("\n") > 20:
-        lines = content.split("\n")
-        for i in range(0, len(lines), 25):
-            group = "\n".join(lines[i : i + 25]).strip()
-            if len(group) > MIN_CHUNK_SIZE:
-                chunks.append({"content": group, "chunk_index": len(chunks)})
-        return chunks
-
-    for para in paragraphs:
-        if len(para) > MIN_CHUNK_SIZE:
-            chunks.append({"content": para, "chunk_index": len(chunks)})
-
-    return chunks
-
-
-# =============================================================================
-# ROOM DETECTION — topic-based for conversations
-# =============================================================================
+CHUNK_SIZE = 800
+MAX_FILE_SIZE = 10 * 1024 * 1024
+TAIL_REWIND_MESSAGES = 2
+REGISTRY_ROOM = "_registry"
+REGISTRY_MODE = "registry"
+CONVO_NORMALIZE_VERSION = max(NORMALIZE_VERSION, 3)
 
 TOPIC_KEYWORDS = {
     "technical": [
@@ -248,112 +92,524 @@ TOPIC_KEYWORDS = {
 }
 
 
-def detect_convo_room(content: str) -> str:
-    """Score conversation content against topic keywords."""
+def _detect_hall_cached(content: str) -> str:
+    global _HALL_KEYWORDS_CACHE
+    if _HALL_KEYWORDS_CACHE is None:
+        from .config import MempalaceConfig
+
+        _HALL_KEYWORDS_CACHE = MempalaceConfig().hall_keywords
     content_lower = content[:3000].lower()
     scores = {}
-    for room, keywords in TOPIC_KEYWORDS.items():
-        score = sum(1 for kw in keywords if kw in content_lower)
+    for hall, keywords in _HALL_KEYWORDS_CACHE.items():
+        score = sum(1 for keyword in keywords if keyword in content_lower)
         if score > 0:
-            scores[room] = score
-    if scores:
-        return max(scores, key=scores.get)
-    return "general"
+            scores[hall] = score
+    return max(scores, key=scores.get) if scores else "general"
 
 
-# =============================================================================
-# PALACE OPERATIONS
-# =============================================================================
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
-# =============================================================================
-# SCAN FOR CONVERSATION FILES
-# =============================================================================
+def _iso_from_epoch(epoch_value):
+    try:
+        return datetime.fromtimestamp(float(epoch_value)).astimezone().isoformat()
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _get_file_state(filepath: Path) -> dict:
+    stat = filepath.stat()
+    return {
+        "source_size": stat.st_size,
+        "source_mtime": float(stat.st_mtime),
+        "source_created_at": _iso_from_epoch(stat.st_ctime),
+        "source_modified_at": _iso_from_epoch(stat.st_mtime),
+    }
+
+
+def _registry_id(source_file: str) -> str:
+    return f"_reg_{hashlib.sha256(source_file.encode('utf-8')).hexdigest()[:24]}"
+
+
+def _drawer_id(source_file: str, room: str, record_kind: str, chunk_key: str) -> str:
+    digest = hashlib.sha256(f"{source_file}|{room}|{record_kind}|{chunk_key}".encode("utf-8")).hexdigest()[:24]
+    return f"drawer_{record_kind}_{digest}"
+
+
+def _message_digest(message: dict) -> str:
+    payload = {
+        "role": message.get("role", ""),
+        "text": message.get("text", ""),
+        "event_time_start": message.get("event_time_start"),
+        "event_time_end": message.get("event_time_end"),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _transcript_digest(transcript: str) -> str:
+    return hashlib.sha256(transcript.encode("utf-8")).hexdigest()
 
 
 def scan_convos(convo_dir: str) -> list:
-    """Find all potential conversation files."""
     convo_path = Path(convo_dir).expanduser().resolve()
     files = []
     for root, dirs, filenames in os.walk(convo_path):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        dirs[:] = [name for name in dirs if name not in SKIP_DIRS]
         for filename in filenames:
             if filename.endswith(".meta.json"):
                 continue
             filepath = Path(root) / filename
-            if filepath.suffix.lower() in CONVO_EXTENSIONS:
-                # Skip symlinks and oversized files
-                if filepath.is_symlink():
+            if filepath.suffix.lower() not in CONVO_EXTENSIONS or filepath.is_symlink():
+                continue
+            try:
+                if filepath.stat().st_size > MAX_FILE_SIZE:
                     continue
-                try:
-                    if filepath.stat().st_size > MAX_FILE_SIZE:
-                        continue
-                except OSError:
-                    continue
-                files.append(filepath)
+            except OSError:
+                continue
+            files.append(filepath)
     return files
 
 
-# =============================================================================
-# MINE CONVERSATIONS
-# =============================================================================
+def chunk_exchanges(content: str) -> list:
+    lines = content.split("\n")
+    if sum(1 for line in lines if line.strip().startswith(">")) >= 3:
+        return _chunk_by_exchange(lines)
+    return _chunk_by_paragraph(content)
 
 
-def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extract_mode):
-    """Lock the source file, purge stale drawers, and upsert fresh chunks.
+def _chunk_by_exchange(lines: list) -> list:
+    chunks = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.strip().startswith(">"):
+            user_turn = line.strip()
+            i += 1
+            ai_lines = []
+            while i < len(lines):
+                next_line = lines[i]
+                if next_line.strip().startswith(">") or next_line.strip().startswith("---"):
+                    break
+                if next_line.strip():
+                    ai_lines.append(next_line.strip())
+                i += 1
 
-    Combines the per-file serialization that prevents concurrent agents from
-    duplicating work (via mine_lock) with the normalize-version rebuild
-    contract (purge-before-insert so pre-v2 drawers don't survive).
+            content = user_turn
+            if ai_lines:
+                content = f"{content}\n{' '.join(ai_lines)}"
+            if len(content) <= CHUNK_SIZE:
+                if len(content.strip()) > MIN_CHUNK_SIZE:
+                    chunks.append({"content": content, "chunk_index": len(chunks)})
+            else:
+                remainder = content
+                part_index = 0
+                while remainder:
+                    part = remainder[:CHUNK_SIZE]
+                    remainder = remainder[CHUNK_SIZE:]
+                    if len(part.strip()) > MIN_CHUNK_SIZE:
+                        chunks.append(
+                            {
+                                "content": part,
+                                "chunk_index": len(chunks),
+                                "chunk_key": f"legacy_{len(chunks)}_{part_index}",
+                            }
+                        )
+                    part_index += 1
+        else:
+            i += 1
+    return chunks
 
-    Returns (drawers_added, room_counts_delta, skipped).
-    """
-    room_counts_delta: dict = defaultdict(int)
-    drawers_added = 0
-    with mine_lock(source_file):
-        # Re-check after lock — another agent may have just finished this file
-        # at the current schema. A stale-version hit here returns False, so we
-        # still fall through to the purge+rebuild path below.
-        if file_already_mined(collection, source_file):
-            return 0, room_counts_delta, True
 
-        # Purge stale drawers first. When the normalize schema bumps,
-        # file_already_mined() returned False for pre-v2 drawers — clean
-        # them out so the source doesn't end up with mixed old/new drawers.
-        try:
-            collection.delete(where={"source_file": source_file})
-        except Exception:
-            pass
+def _chunk_by_paragraph(content: str) -> list:
+    chunks = []
+    paragraphs = [paragraph.strip() for paragraph in content.split("\n\n") if paragraph.strip()]
+    if len(paragraphs) <= 1 and content.count("\n") > 20:
+        lines = content.split("\n")
+        for i in range(0, len(lines), 25):
+            group = "\n".join(lines[i : i + 25]).strip()
+            if len(group) > MIN_CHUNK_SIZE:
+                chunks.append({"content": group, "chunk_index": len(chunks)})
+        return chunks
 
+    for paragraph in paragraphs:
+        if len(paragraph) > MIN_CHUNK_SIZE:
+            chunks.append({"content": paragraph, "chunk_index": len(chunks)})
+    return chunks
+
+
+def detect_convo_room(content: str) -> str:
+    content_lower = content[:3000].lower()
+    scores = {}
+    for room, keywords in TOPIC_KEYWORDS.items():
+        score = sum(1 for keyword in keywords if keyword in content_lower)
+        if score > 0:
+            scores[room] = score
+    return max(scores, key=scores.get) if scores else "general"
+
+
+def _append_split_chunk(
+    chunks: list,
+    content: str,
+    chunk_index_base: int,
+    start_seq: int,
+    end_seq: int,
+    start_time,
+    end_time,
+    record_kind: str,
+):
+    remainder = content
+    part_index = 0
+    while remainder:
+        part = remainder[:CHUNK_SIZE]
+        remainder = remainder[CHUNK_SIZE:]
+        if len(part.strip()) <= MIN_CHUNK_SIZE:
+            part_index += 1
+            continue
+        chunks.append(
+            {
+                "content": part,
+                "chunk_index": chunk_index_base + len(chunks),
+                "chunk_key": f"{record_kind}_{start_seq}_{end_seq}_{part_index}",
+                "source_message_start_idx": start_seq,
+                "source_message_end_idx": end_seq,
+                "event_time_start": start_time,
+                "event_time_end": end_time or start_time,
+                "event_at": end_time or start_time,
+                "record_kind": record_kind,
+            }
+        )
+        part_index += 1
+
+
+def _chunk_message_exchanges(messages: list, chunk_index_base: int = 0) -> list:
+    chunks = []
+    i = 0
+    while i < len(messages):
+        message = messages[i]
+        if message.get("role") != "user":
+            i += 1
+            continue
+
+        start_seq = _safe_int(message.get("seq"), i)
+        end_seq = start_seq
+        start_time = message.get("event_time_start") or message.get("event_time_end")
+        end_time = message.get("event_time_end") or start_time
+        user_turn = message.get("text", "").strip()
+        i += 1
+
+        assistant_parts = []
+        while i < len(messages) and messages[i].get("role") != "user":
+            text = messages[i].get("text", "").strip()
+            if text:
+                assistant_parts.append(text)
+            end_seq = _safe_int(messages[i].get("seq"), end_seq)
+            end_time = messages[i].get("event_time_end") or messages[i].get("event_time_start") or end_time
+            i += 1
+
+        content = f"> {user_turn}" if user_turn else ""
+        if assistant_parts:
+            content = content + "\n" + "\n".join(assistant_parts) if content else "\n".join(assistant_parts)
+        if len(content.strip()) <= MIN_CHUNK_SIZE:
+            continue
+        _append_split_chunk(
+            chunks,
+            content,
+            chunk_index_base,
+            start_seq,
+            end_seq,
+            start_time,
+            end_time,
+            "transcript",
+        )
+    return chunks
+
+
+def _extract_general_chunks(normalized_data: dict, chunk_index_base: int = 0) -> list:
+    from .general_extractor import extract_memories
+
+    transcript = normalized_data.get("transcript", "")
+    if not transcript:
+        return []
+    memories = extract_memories(transcript)
+    if not memories:
+        return []
+
+    messages = normalized_data.get("messages", [])
+    if messages:
+        start_seq = _safe_int(messages[0].get("seq"), 0)
+        end_seq = _safe_int(messages[-1].get("seq"), start_seq)
+        start_time = messages[0].get("event_time_start") or messages[0].get("event_time_end")
+        end_time = messages[-1].get("event_time_end") or messages[-1].get("event_time_start") or start_time
+        timestamp_source = "message_timestamp" if end_time or start_time else None
+    else:
+        start_seq = -1
+        end_seq = -1
+        start_time = None
+        end_time = None
+        timestamp_source = None
+
+    chunks = []
+    for idx, memory in enumerate(memories):
+        chunk = dict(memory)
+        chunk["chunk_index"] = chunk_index_base + idx
+        chunk["chunk_key"] = f"memory_{start_seq}_{end_seq}_{idx}"
+        chunk["source_message_start_idx"] = start_seq
+        chunk["source_message_end_idx"] = end_seq
+        chunk["event_time_start"] = start_time
+        chunk["event_time_end"] = end_time
+        chunk["event_at"] = end_time or start_time
+        chunk["timestamp_source"] = timestamp_source
+        chunk["record_kind"] = "memory"
+        chunks.append(chunk)
+    return chunks
+
+
+def _stamp_fallback_chunks(chunks: list, file_state: dict, chunk_index_base: int = 0, record_kind: str = "transcript") -> list:
+    event_at = file_state.get("source_modified_at")
+    timestamp_source = "file_mtime" if event_at else "ingest_time"
+    stamped = []
+    for idx, chunk in enumerate(chunks):
+        row = dict(chunk)
+        row["chunk_index"] = chunk_index_base + idx
+        row["chunk_key"] = row.get("chunk_key", f"{record_kind}_{chunk_index_base + idx}")
+        row["source_message_start_idx"] = row.get("source_message_start_idx", -1)
+        row["source_message_end_idx"] = row.get("source_message_end_idx", -1)
+        row["event_time_start"] = row.get("event_time_start", event_at)
+        row["event_time_end"] = row.get("event_time_end", event_at)
+        row["event_at"] = row.get("event_at", event_at)
+        row["timestamp_source"] = row.get("timestamp_source", timestamp_source)
+        row["record_kind"] = row.get("record_kind", record_kind)
+        stamped.append(row)
+    return stamped
+
+
+def _build_transcript_chunks(normalized_data: dict, file_state: dict, chunk_index_base: int = 0, messages_override=None) -> list:
+    messages = messages_override if messages_override is not None else normalized_data.get("messages", [])
+    if messages:
+        chunks = _chunk_message_exchanges(messages, chunk_index_base=chunk_index_base)
         for chunk in chunks:
-            chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
-            if extract_mode == "general":
-                room_counts_delta[chunk_room] += 1
-            drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
-            try:
-                collection.upsert(
-                    documents=[chunk["content"]],
-                    ids=[drawer_id],
-                    metadatas=[
-                        {
-                            "wing": wing,
-                            "room": chunk_room,
-                            "hall": _detect_hall_cached(chunk["content"]),
-                            "source_file": source_file,
-                            "chunk_index": chunk["chunk_index"],
-                            "added_by": agent,
-                            "filed_at": datetime.now().isoformat(),
-                            "ingest_mode": "convos",
-                            "extract_mode": extract_mode,
-                            "normalize_version": NORMALIZE_VERSION,
-                        }
-                    ],
-                )
-                drawers_added += 1
-            except Exception as e:
-                if "already exists" not in str(e).lower():
-                    raise
-    return drawers_added, room_counts_delta, False
+            chunk["timestamp_source"] = "message_timestamp" if chunk.get("event_at") else "file_mtime"
+        return chunks
+    transcript = normalized_data.get("transcript", "")
+    return _stamp_fallback_chunks(chunk_exchanges(transcript), file_state, chunk_index_base)
+
+
+def _load_source_state(collection, source_file: str):
+    try:
+        results = collection.get(where={"source_file": source_file}, include=["metadatas"])
+    except Exception:
+        return None, []
+    registry = None
+    drawers = []
+    for row_id, metadata in zip(results.get("ids", []) or [], results.get("metadatas", []) or []):
+        metadata = metadata or {}
+        if metadata.get("room") == REGISTRY_ROOM and metadata.get("ingest_mode") == REGISTRY_MODE:
+            registry = {"id": row_id, "metadata": metadata}
+        else:
+            drawers.append({"id": row_id, "metadata": metadata})
+    return registry, drawers
+
+
+def _delete_source(collection, source_file: str):
+    try:
+        collection.delete(where={"source_file": source_file})
+    except Exception:
+        pass
+
+
+def _delete_tail_drawers(collection, drawers: list, overlap_start: int):
+    ids = []
+    for drawer in drawers:
+        metadata = drawer.get("metadata") or {}
+        end_idx = metadata.get("source_message_end_idx")
+        if end_idx is None:
+            continue
+        if _safe_int(end_idx, -1) >= overlap_start:
+            ids.append(drawer["id"])
+    if ids:
+        collection.delete(ids=ids)
+
+
+def _last_chunk_index(drawers: list) -> int:
+    last_index = -1
+    for drawer in drawers:
+        metadata = drawer.get("metadata") or {}
+        last_index = max(last_index, _safe_int(metadata.get("chunk_index"), -1))
+    return last_index
+
+
+def _registry_matches_file(registry_meta: dict, file_state: dict, transcript_digest: str) -> bool:
+    if not registry_meta:
+        return False
+    if _safe_int(registry_meta.get("normalize_version"), 0) < CONVO_NORMALIZE_VERSION:
+        return False
+    stored_size = _safe_int(registry_meta.get("source_size"), -1)
+    stored_mtime = registry_meta.get("source_modified_at")
+    return (
+        stored_size == _safe_int(file_state.get("source_size"), -2)
+        and stored_mtime == file_state.get("source_modified_at")
+        and registry_meta.get("transcript_digest", "") == transcript_digest
+    )
+
+
+def _plan_exchange_update(registry_meta: dict, drawers: list, messages: list, transcript_digest: str, file_state: dict):
+    if registry_meta is None:
+        return {"mode": "full", "rewind_from": 0}
+    if _safe_int(registry_meta.get("normalize_version"), 0) < CONVO_NORMALIZE_VERSION:
+        return {"mode": "full", "rewind_from": 0}
+
+    stored_size = _safe_int(registry_meta.get("source_size"), -1)
+    current_size = _safe_int(file_state.get("source_size"), -1)
+    stored_count = _safe_int(registry_meta.get("message_count"), 0)
+
+    if current_size < stored_size or len(messages) < stored_count:
+        return {"mode": "full", "rewind_from": 0}
+    if len(messages) == stored_count:
+        if registry_meta.get("transcript_digest", "") == transcript_digest:
+            return {"mode": "noop", "rewind_from": 0}
+        return {"mode": "full", "rewind_from": 0}
+
+    stored_last_digest = registry_meta.get("last_message_digest", "")
+    if stored_count > 0:
+        boundary = messages[stored_count - 1]
+        if not stored_last_digest or _message_digest(boundary) != stored_last_digest:
+            return {"mode": "full", "rewind_from": 0}
+
+    if any("source_message_end_idx" not in (drawer.get("metadata") or {}) for drawer in drawers):
+        return {"mode": "full", "rewind_from": 0}
+
+    rewind_from = max(0, stored_count - TAIL_REWIND_MESSAGES)
+    return {"mode": "incremental", "rewind_from": rewind_from}
+
+
+def _build_registry_metadata(
+    source_file: str,
+    wing: str,
+    agent: str,
+    file_state: dict,
+    normalized_data: dict,
+    transcript_digest: str,
+    last_chunk_index: int,
+    extract_mode: str,
+):
+    messages = normalized_data.get("messages", []) or []
+    filed_at = datetime.now().isoformat()
+    metadata = {
+        "wing": wing,
+        "room": REGISTRY_ROOM,
+        "source_file": source_file,
+        "added_by": agent,
+        "filed_at": filed_at,
+        "ingest_mode": REGISTRY_MODE,
+        "extract_mode": extract_mode,
+        "normalize_version": CONVO_NORMALIZE_VERSION,
+        "source_size": _safe_int(file_state.get("source_size"), 0),
+        "source_mtime": file_state.get("source_mtime"),
+        "source_created_at": file_state.get("source_created_at"),
+        "source_modified_at": file_state.get("source_modified_at"),
+        "message_count": len(messages),
+        "last_chunk_index": last_chunk_index,
+        "transcript_digest": transcript_digest,
+        "source_format": normalized_data.get("source_format", ""),
+    }
+    session_id = normalized_data.get("session_id")
+    if session_id:
+        metadata["source_session_id"] = session_id
+
+    if messages:
+        metadata["last_message_digest"] = _message_digest(messages[-1])
+        start_time = messages[0].get("event_time_start") or messages[0].get("event_time_end")
+        end_time = messages[-1].get("event_time_end") or messages[-1].get("event_time_start") or start_time
+        metadata["event_time_start"] = start_time
+        metadata["event_time_end"] = end_time
+        metadata["event_at"] = end_time or file_state.get("source_modified_at") or filed_at
+        metadata["timestamp_source"] = "message_timestamp" if end_time or start_time else "file_mtime"
+    else:
+        fallback = file_state.get("source_modified_at") or filed_at
+        metadata["event_time_start"] = fallback
+        metadata["event_time_end"] = fallback
+        metadata["event_at"] = fallback
+        metadata["timestamp_source"] = "file_mtime" if file_state.get("source_modified_at") else "ingest_time"
+    return metadata
+
+
+def _upsert_registry(collection, metadata: dict):
+    source_file = metadata["source_file"]
+    collection.upsert(
+        documents=[f"[registry] {source_file}"],
+        ids=[_registry_id(source_file)],
+        metadatas=[metadata],
+    )
+
+
+def _upsert_chunks(collection, chunks: list, wing: str, agent: str, source_file: str, file_state: dict, normalized_data: dict):
+    for chunk in chunks:
+        room = chunk["room"]
+        metadata = {
+            "wing": wing,
+            "room": room,
+            "hall": _detect_hall_cached(chunk["content"]),
+            "source_file": source_file,
+            "chunk_index": chunk["chunk_index"],
+            "chunk_key": chunk["chunk_key"],
+            "added_by": agent,
+            "filed_at": datetime.now().isoformat(),
+            "ingest_mode": "convos",
+            "record_kind": chunk.get("record_kind", "transcript"),
+            "extract_mode": chunk.get("extract_mode", "exchange"),
+            "normalize_version": CONVO_NORMALIZE_VERSION,
+            "source_message_start_idx": chunk.get("source_message_start_idx", -1),
+            "source_message_end_idx": chunk.get("source_message_end_idx", -1),
+            "event_time_start": chunk.get("event_time_start"),
+            "event_time_end": chunk.get("event_time_end"),
+            "event_at": chunk.get("event_at") or file_state.get("source_modified_at"),
+            "timestamp_source": chunk.get("timestamp_source", "file_mtime"),
+            "source_mtime": file_state.get("source_mtime"),
+            "source_created_at": file_state.get("source_created_at"),
+            "source_modified_at": file_state.get("source_modified_at"),
+            "source_format": normalized_data.get("source_format", ""),
+        }
+        session_id = normalized_data.get("session_id")
+        if session_id:
+            metadata["source_session_id"] = session_id
+        collection.upsert(
+            documents=[chunk["content"]],
+            ids=[_drawer_id(source_file, room, metadata["record_kind"], chunk["chunk_key"])],
+            metadatas=[metadata],
+        )
+
+
+def _prepare_transcript_chunks(normalized_data: dict, file_state: dict, room: str, extract_mode: str, chunk_index_base: int = 0, messages_override=None):
+    chunks = _build_transcript_chunks(
+        normalized_data,
+        file_state,
+        chunk_index_base=chunk_index_base,
+        messages_override=messages_override,
+    )
+    for chunk in chunks:
+        chunk["room"] = room
+        chunk["extract_mode"] = extract_mode
+    return chunks
+
+
+def _prepare_memory_chunks(normalized_data: dict, file_state: dict, chunk_index_base: int):
+    chunks = _extract_general_chunks(normalized_data, chunk_index_base=chunk_index_base)
+    if not chunks:
+        return []
+    stamped = _stamp_fallback_chunks(
+        chunks,
+        file_state,
+        chunk_index_base=chunk_index_base,
+        record_kind="memory",
+    )
+    for chunk in stamped:
+        chunk["room"] = chunk.get("memory_type", "general")
+        chunk["extract_mode"] = "general"
+    return stamped
 
 
 def mine_convos(
@@ -365,13 +621,6 @@ def mine_convos(
     dry_run: bool = False,
     extract_mode: str = "exchange",
 ):
-    """Mine a directory of conversation files into the palace.
-
-    extract_mode:
-        "exchange" — default exchange-pair chunking (Q+A = one unit)
-        "general"  — general extractor: decisions, preferences, milestones, problems, emotions
-    """
-
     convo_path = Path(convo_dir).expanduser().resolve()
     if not wing:
         wing = convo_path.name.lower().replace(" ", "_").replace("-", "_")
@@ -381,97 +630,137 @@ def mine_convos(
         files = files[:limit]
 
     print(f"\n{'=' * 55}")
-    print("  MemPalace Mine — Conversations")
+    print("  MemPalace Mine - Conversations")
     print(f"{'=' * 55}")
     print(f"  Wing:    {wing}")
     print(f"  Source:  {convo_path}")
     print(f"  Files:   {len(files)}")
     print(f"  Palace:  {palace_path}")
     if dry_run:
-        print("  DRY RUN — nothing will be filed")
+        print("  DRY RUN - nothing will be filed")
     print(f"{'-' * 55}\n")
 
     collection = get_collection(palace_path) if not dry_run else None
-
     total_drawers = 0
     files_skipped = 0
     room_counts = defaultdict(int)
 
-    for i, filepath in enumerate(files, 1):
+    for index, filepath in enumerate(files, 1):
         source_file = str(filepath)
+        file_state = _get_file_state(filepath)
 
-        # Skip if already filed
-        if not dry_run and file_already_mined(collection, source_file):
-            files_skipped += 1
-            continue
-
-        # Normalize format
         try:
-            content = normalize(str(filepath))
+            normalized_data = normalize_with_metadata(source_file)
         except (OSError, ValueError):
-            if not dry_run:
-                _register_file(collection, source_file, wing, agent)
-            continue
+            normalized_data = {
+                "transcript": "",
+                "messages": [],
+                "source_format": "error",
+                "session_id": None,
+            }
 
-        if not content or len(content.strip()) < MIN_CHUNK_SIZE:
-            if not dry_run:
-                _register_file(collection, source_file, wing, agent)
-            continue
+        transcript = normalized_data.get("transcript", "")
+        transcript_digest = _transcript_digest(transcript)
+        transcript_room = detect_convo_room(transcript) if transcript else "general"
+        transcript_chunks = []
+        memory_chunks = []
 
-        # Chunk — either exchange pairs or general extraction
-        if extract_mode == "general":
-            from .general_extractor import extract_memories
+        if transcript and len(transcript.strip()) >= MIN_CHUNK_SIZE:
+            transcript_chunks = _prepare_transcript_chunks(
+                normalized_data,
+                file_state,
+                room=transcript_room,
+                extract_mode=extract_mode,
+            )
+            if extract_mode == "general":
+                memory_chunks = _prepare_memory_chunks(normalized_data, file_state, len(transcript_chunks))
 
-            chunks = extract_memories(content)
-            # Each chunk already has memory_type; use it as the room name
-        else:
-            chunks = chunk_exchanges(content)
-
-        if not chunks:
-            if not dry_run:
-                _register_file(collection, source_file, wing, agent)
-            continue
-
-        # Detect room from content (general mode uses memory_type instead)
-        if extract_mode != "general":
-            room = detect_convo_room(content)
-        else:
-            room = None  # set per-chunk below
+        planned_chunks = transcript_chunks + memory_chunks
 
         if dry_run:
-            if extract_mode == "general":
-                from collections import Counter
-
-                type_counts = Counter(c.get("memory_type", "general") for c in chunks)
-                types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
-                print(f"    [DRY RUN] {filepath.name} → {len(chunks)} memories ({types_str})")
+            if planned_chunks:
+                print(f"    [DRY RUN] {filepath.name} -> {len(planned_chunks)} drawers")
+                for chunk in planned_chunks:
+                    room_counts[chunk["room"]] += 1
+                total_drawers += len(planned_chunks)
             else:
-                print(f"    [DRY RUN] {filepath.name} → room:{room} ({len(chunks)} drawers)")
-            total_drawers += len(chunks)
-            # Track room counts
-            if extract_mode == "general":
-                for c in chunks:
-                    room_counts[c.get("memory_type", "general")] += 1
-            else:
-                room_counts[room] += 1
+                print(f"    [DRY RUN] {filepath.name} -> registry only")
             continue
 
-        if extract_mode != "general":
-            room_counts[room] += 1
+        with mine_lock(source_file):
+            registry, existing_drawers = _load_source_state(collection, source_file)
+            registry_meta = registry["metadata"] if registry else None
+            surviving_drawers = []
 
-        # Lock + purge stale + file fresh chunks. Lock serializes concurrent
-        # agents; purge removes pre-v2 drawers so the schema bump applies.
-        drawers_added, room_delta, skipped = _file_chunks_locked(
-            collection, source_file, chunks, wing, room, agent, extract_mode
-        )
-        if skipped:
-            files_skipped += 1
-            continue
-        for r, n in room_delta.items():
-            room_counts[r] += n
+            if _registry_matches_file(registry_meta, file_state, transcript_digest):
+                files_skipped += 1
+                continue
 
-        total_drawers += drawers_added
-        print(f"  ✓ [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
+            if extract_mode == "general":
+                plan = {"mode": "full", "rewind_from": 0}
+            else:
+                plan = _plan_exchange_update(
+                    registry_meta,
+                    existing_drawers,
+                    normalized_data.get("messages", []) or [],
+                    transcript_digest,
+                    file_state,
+                )
+
+            if plan["mode"] == "noop":
+                files_skipped += 1
+                continue
+
+            if plan["mode"] == "full":
+                _delete_source(collection, source_file)
+                chunks_to_write = planned_chunks
+            else:
+                overlap_start = plan["rewind_from"]
+                _delete_tail_drawers(collection, existing_drawers, overlap_start)
+                surviving_drawers = [
+                    drawer
+                    for drawer in existing_drawers
+                    if _safe_int((drawer.get("metadata") or {}).get("source_message_end_idx"), -1) < overlap_start
+                ]
+                chunk_index_base = _last_chunk_index(surviving_drawers) + 1
+                partial_messages = [
+                    message
+                    for message in normalized_data.get("messages", []) or []
+                    if _safe_int(message.get("seq"), -1) >= overlap_start
+                ]
+                chunks_to_write = _prepare_transcript_chunks(
+                    normalized_data,
+                    file_state,
+                    room=transcript_room,
+                    extract_mode=extract_mode,
+                    chunk_index_base=chunk_index_base,
+                    messages_override=partial_messages,
+                )
+
+            if chunks_to_write:
+                _upsert_chunks(collection, chunks_to_write, wing, agent, source_file, file_state, normalized_data)
+                for chunk in chunks_to_write:
+                    room_counts[chunk["room"]] += 1
+            else:
+                _delete_source(collection, source_file)
+
+            registry_metadata = _build_registry_metadata(
+                source_file=source_file,
+                wing=wing,
+                agent=agent,
+                file_state=file_state,
+                normalized_data=normalized_data,
+                transcript_digest=transcript_digest,
+                last_chunk_index=max(
+                    _last_chunk_index(surviving_drawers),
+                    _last_chunk_index([{"metadata": {"chunk_index": chunk["chunk_index"]}} for chunk in chunks_to_write]),
+                ),
+                extract_mode=extract_mode,
+            )
+            _upsert_registry(collection, registry_metadata)
+
+            total_drawers += len(chunks_to_write)
+            print(f"  + [{index:4}/{len(files)}] {filepath.name[:50]:50} {len(chunks_to_write)}")
 
     print(f"\n{'=' * 55}")
     print("  Done.")
@@ -480,9 +769,9 @@ def mine_convos(
     print(f"  Drawers filed: {total_drawers}")
     if room_counts:
         print("\n  By room:")
-        for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
-            print(f"    {room:20} {count} files")
-    print('\n  Next: mempalace search "what you\'re looking for"')
+        for room, count in sorted(room_counts.items(), key=lambda item: item[1], reverse=True):
+            print(f"    {room:20} {count} drawers")
+    print('\n  Next: mempalace search "what you are looking for"')
     print(f"{'=' * 55}\n")
 
 

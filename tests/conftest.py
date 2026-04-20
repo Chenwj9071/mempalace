@@ -11,12 +11,15 @@ instead of the real user profile.
 """
 
 import os
+from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 
 # ── Isolate HOME before any mempalace imports ──────────────────────────
 _original_env = {}
 _session_tmp = tempfile.mkdtemp(prefix="mempalace_session_")
+_shared_chroma_cache = Path(r"C:\Users\Administrator\.cache\chroma")
 
 for _var in ("HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"):
     _original_env[_var] = os.environ.get(_var)
@@ -25,6 +28,44 @@ os.environ["HOME"] = _session_tmp
 os.environ["USERPROFILE"] = _session_tmp
 os.environ["HOMEDRIVE"] = os.path.splitdrive(_session_tmp)[0] or "C:"
 os.environ["HOMEPATH"] = os.path.splitdrive(_session_tmp)[1] or _session_tmp
+
+
+def _attach_shared_chroma_cache():
+    """Reuse the machine-level Chroma cache inside the isolated HOME."""
+    if not _shared_chroma_cache.exists():
+        return
+
+    session_cache_root = Path(_session_tmp) / ".cache"
+    session_cache_root.mkdir(parents=True, exist_ok=True)
+    session_chroma_cache = session_cache_root / "chroma"
+    if session_chroma_cache.exists():
+        return
+
+    try:
+        os.symlink(_shared_chroma_cache, session_chroma_cache, target_is_directory=True)
+        return
+    except OSError:
+        pass
+
+    try:
+        subprocess.run(
+            [
+                "cmd",
+                "/c",
+                "mklink",
+                "/J",
+                str(session_chroma_cache),
+                str(_shared_chroma_cache),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+_attach_shared_chroma_cache()
 
 # Now it is safe to import mempalace modules that trigger initialisation.
 import chromadb  # noqa: E402

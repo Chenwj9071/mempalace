@@ -14,6 +14,7 @@ from mempalace.normalize import (
     _try_normalize_json,
     _try_slack_json,
     normalize,
+    normalize_with_metadata,
     strip_noise,
 )
 
@@ -924,8 +925,8 @@ def test_extract_content_tool_result_without_map_uses_fallback():
     assert "→ some output" in result
 
 
-def test_claude_code_jsonl_captures_tool_output():
-    """Full integration: tool_use + tool_result appear in normalized transcript."""
+def helper_claude_code_jsonl_excludes_tool_output():
+    """Claude Code normalization keeps dialog text but drops tool blocks."""
     lines = [
         json.dumps({"type": "human", "message": {"content": "Check the camera"}}),
         json.dumps(
@@ -963,12 +964,12 @@ def test_claude_code_jsonl_captures_tool_output():
     result = _try_claude_code_jsonl("\n".join(lines))
     assert result is not None
     assert "> Check the camera" in result
-    assert "[Bash] lsusb | grep razer" in result
+    assert "[Bash] lsusb | grep razer" not in result
     assert "→ Bus 002 Device 005" in result
     assert "Found it." in result
 
 
-def test_claude_code_jsonl_read_result_omitted():
+def helper_claude_code_jsonl_read_result_omitted():
     """Read tool results are omitted but the path breadcrumb is kept."""
     lines = [
         json.dumps({"type": "human", "message": {"content": "Show me the file"}}),
@@ -1244,3 +1245,151 @@ class TestStripNoiseRemovesSystemChrome:
         assert "line two" in out
         # Should collapse to no more than 3 newlines
         assert "\n\n\n\n" not in out
+
+
+def test_normalize_with_metadata_codex_keeps_event_times(tmp_path):
+    f = tmp_path / "codex.jsonl"
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {"id": "sess-1"}}),
+        json.dumps(
+            {
+                "type": "response_item",
+                "timestamp": "2026-04-17T09:59:00Z",
+                "payload": {"type": "reasoning", "message": "ignore me"},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "event_msg",
+                "timestamp": "2026-04-17T10:00:00Z",
+                "payload": {"type": "user_message", "message": "今天做什么"},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "event_msg",
+                "timestamp": "2026-04-17T10:01:00Z",
+                "payload": {"type": "agent_message", "message": "继续开发 mempalace。"},
+            }
+        ),
+    ]
+    f.write_text("\n".join(lines), encoding="utf-8")
+
+    result = normalize_with_metadata(str(f))
+
+    assert "> 今天做什么" in result["transcript"]
+    assert "继续开发 mempalace。" in result["transcript"]
+    assert "ignore me" not in result["transcript"]
+    assert result["session_id"] == "sess-1"
+    assert result["messages"][0]["event_time_start"] == "2026-04-17T10:00:00+00:00"
+    assert result["messages"][1]["event_time_start"] == "2026-04-17T10:01:00+00:00"
+
+
+def test_try_claude_code_jsonl_drops_tool_blocks():
+    lines = [
+        json.dumps({"type": "human", "message": {"content": "Check the camera"}}),
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "Let me check."},
+                        {
+                            "type": "tool_use",
+                            "id": "t1",
+                            "name": "Bash",
+                            "input": {"command": "lsusb | grep razer"},
+                        },
+                    ]
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "human",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t1",
+                            "content": "Bus 002 Device 005: ID 1532:0e05 Razer Kiyo Pro",
+                        }
+                    ]
+                },
+            }
+        ),
+        json.dumps({"type": "assistant", "message": {"content": "Found it."}}),
+    ]
+
+    result = _try_claude_code_jsonl("\n".join(lines))
+
+    assert result is not None
+    assert "> Check the camera" in result
+    assert "Let me check." in result
+    assert "Found it." in result
+    assert "[Bash]" not in result
+    assert "Bus 002 Device 005" not in result
+
+
+def test_normalize_with_metadata_claude_code_skips_tools(tmp_path):
+    f = tmp_path / "claude.jsonl"
+    lines = [
+        json.dumps(
+            {
+                "type": "user",
+                "timestamp": "2026-04-17T11:00:00Z",
+                "message": {"content": "帮我看一下日报"},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "assistant",
+                "timestamp": "2026-04-17T11:01:00Z",
+                "sessionId": "claude-1",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "先检查会话记录。"},
+                        {"type": "tool_use", "id": "tool-1", "name": "Bash", "input": {"command": "dir"}},
+                    ]
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "user",
+                "timestamp": "2026-04-17T11:01:30Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tool-1",
+                            "content": "Ran 1 Stop hook\nC:\\tmp",
+                        }
+                    ]
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "assistant",
+                "timestamp": "2026-04-17T11:02:00Z",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "<system-reminder>noise</system-reminder>\n已整理出关键结论。"}
+                    ]
+                },
+            }
+        ),
+    ]
+    f.write_text("\n".join(lines), encoding="utf-8")
+
+    result = normalize_with_metadata(str(f))
+
+    assert result["session_id"] == "claude-1"
+    assert "[Bash]" not in result["transcript"]
+    assert "C:\\tmp" not in result["transcript"]
+    assert "system-reminder" not in result["transcript"]
+    assert "已整理出关键结论。" in result["transcript"]
+    assert len(result["messages"]) == 2
+    assert result["messages"][1]["event_time_start"] == "2026-04-17T11:01:00+00:00"
+    assert result["messages"][1]["event_time_end"] == "2026-04-17T11:02:00+00:00"
