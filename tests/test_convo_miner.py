@@ -298,3 +298,55 @@ def test_mine_convos_general_mode_keeps_transcript_and_memories():
         assert "memory" in kinds
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_mine_convos_writes_task_hint_for_transcript_chunks():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        convo = Path(tmpdir) / "chat.jsonl"
+        convo.write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "session_meta", "payload": {"id": "sess-task-hint"}}),
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "timestamp": "2026-04-18T12:00:00Z",
+                            "payload": {
+                                "type": "user_message",
+                                "message": "Please implement search_events MCP support and evidence expansion.",
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "timestamp": "2026-04-18T12:01:00Z",
+                            "payload": {
+                                "type": "agent_message",
+                                "message": "search_events CLI and MCP integration are now wired for review.",
+                            },
+                        }
+                    ),
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        palace_path = os.path.join(tmpdir, "palace")
+        mine_convos(tmpdir, palace_path, wing="test")
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        resolved = str(convo.resolve())
+        results = col.get(where={"source_file": resolved})
+        transcript_hints = [
+            (meta or {}).get("task_hint")
+            for meta in results["metadatas"]
+            if (meta or {}).get("record_kind") == "transcript"
+        ]
+
+        assert transcript_hints
+        assert "search_events" in transcript_hints
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)

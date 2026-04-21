@@ -114,6 +114,7 @@ class TestHandleRequest:
         names = {t["name"] for t in tools}
         assert "mempalace_status" in names
         assert "mempalace_search" in names
+        assert "mempalace_search_events" in names
         assert "mempalace_add_drawer" in names
         assert "mempalace_kg_add" in names
 
@@ -320,6 +321,62 @@ class TestSearchTool:
 
         result = tool_search(query="database", room="backend")
         assert all(r["room"] == "backend" for r in result["results"])
+
+    def test_search_events_basic(self, monkeypatch, config, palace_path, collection, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        collection.add(
+            ids=["drawer_evt_1", "drawer_evt_2"],
+            documents=[
+                "Implemented search_events MVP and grouped output.",
+                "Next step: wire MCP tool and evidence expansion.",
+            ],
+            metadatas=[
+                {
+                    "wing": "project",
+                    "room": "planning",
+                    "source_file": "evt.jsonl",
+                    "source_session_id": "sess-evt",
+                    "record_kind": "transcript",
+                    "added_by": "codex",
+                    "event_time_start": "2026-04-20T09:00:00",
+                    "event_time_end": "2026-04-20T09:05:00",
+                    "event_at": "2026-04-20T09:05:00",
+                    "timestamp_source": "message_timestamp",
+                },
+                {
+                    "wing": "project",
+                    "room": "planning",
+                    "source_file": "evt.jsonl",
+                    "source_session_id": "sess-evt",
+                    "record_kind": "memory",
+                    "added_by": "codex",
+                    "event_time_start": "2026-04-20T09:00:00",
+                    "event_time_end": "2026-04-20T09:05:00",
+                    "event_at": "2026-04-20T09:05:00",
+                    "timestamp_source": "message_timestamp",
+                },
+            ],
+        )
+        from mempalace.mcp_server import tool_search_events
+
+        result = tool_search_events(
+            time_from="2026-04-20",
+            time_to="2026-04-20",
+            wing="project",
+            rooms=["planning"],
+            expand_level="grouped",
+        )
+        assert result["stats"]["matched_records"] == 2
+        assert result["groups"][0]["title"] == "Session sess-evt"
+        assert "progress" in result["groups"][0]
+
+    def test_search_events_rejects_invalid_room(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "search_events", lambda **kwargs: pytest.fail())
+        result = mcp_server.tool_search_events(time_from="2026-04-20", rooms=["../backend"])
+        assert "error" in result
 
     def test_search_min_similarity_backwards_compat(
         self, monkeypatch, config, palace_path, seeded_collection, kg

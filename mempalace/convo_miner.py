@@ -11,6 +11,7 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+from .event_search import derive_task_hint
 from .normalize import normalize_with_metadata
 from .palace import NORMALIZE_VERSION, SKIP_DIRS, get_collection, mine_lock
 
@@ -576,6 +577,9 @@ def _upsert_chunks(collection, chunks: list, wing: str, agent: str, source_file:
         session_id = normalized_data.get("session_id")
         if session_id:
             metadata["source_session_id"] = session_id
+        task_hint = derive_task_hint(chunk["content"])
+        if task_hint:
+            metadata["task_hint"] = task_hint
         collection.upsert(
             documents=[chunk["content"]],
             ids=[_drawer_id(source_file, room, metadata["record_kind"], chunk["chunk_key"])],

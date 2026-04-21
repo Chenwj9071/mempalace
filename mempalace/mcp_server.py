@@ -59,7 +59,8 @@ from .config import (  # noqa: E402
 from .version import __version__  # noqa: E402
 from .backends.chroma import ChromaBackend, ChromaCollection  # noqa: E402
 from .query_sanitizer import sanitize_query  # noqa: E402
-from .searcher import search_memories  # noqa: E402
+from .searcher import SearchError, search_memories  # noqa: E402
+from .event_search import search_events  # noqa: E402
 from .palace_graph import (  # noqa: E402
     traverse,
     find_tunnels,
@@ -290,6 +291,24 @@ def _sanitize_optional_name(value: str = None, field_name: str = "name") -> str:
     return sanitize_name(value, field_name)
 
 
+def _sanitize_name_list(values, field_name: str) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = [values]
+    sanitized: list[str] = []
+    for raw in values:
+        if raw is None:
+            continue
+        if not isinstance(raw, str):
+            raise ValueError(f"{field_name} must contain only strings")
+        for part in raw.split(","):
+            part = part.strip()
+            if part:
+                sanitized.append(sanitize_name(part, field_name))
+    return sanitized
+
+
 # ==================== READ TOOLS ====================
 
 
@@ -461,6 +480,62 @@ def tool_search(
         }
     if context:
         result["context_received"] = True
+    return result
+
+
+def tool_search_events(
+    time_from: str = None,
+    time_to: str = None,
+    query: str = None,
+    wing: str = None,
+    rooms=None,
+    record_kinds=None,
+    agents=None,
+    group_by: str = "task",
+    expand_level: str = "overview",
+    limit_groups: int = 10,
+    limit_evidence_per_group: int = 3,
+    include_low_confidence: bool = False,
+):
+    limit_groups = max(1, min(limit_groups, _MAX_RESULTS))
+    limit_evidence_per_group = max(1, min(limit_evidence_per_group, _MAX_RESULTS))
+    try:
+        wing = _sanitize_optional_name(wing, "wing")
+        rooms = _sanitize_name_list(rooms, "rooms")
+        record_kinds = _sanitize_name_list(record_kinds, "record_kinds")
+        agents = _sanitize_name_list(agents, "agents")
+    except ValueError as e:
+        return {"error": str(e)}
+
+    sanitized_query = sanitize_query(query) if query else None
+    clean_query = sanitized_query["clean_query"] if sanitized_query else None
+    try:
+        result = search_events(
+            palace_path=_config.palace_path,
+            time_from=time_from,
+            time_to=time_to,
+            query=clean_query,
+            wing=wing,
+            rooms=rooms,
+            record_kinds=record_kinds,
+            agents=agents,
+            group_by=group_by,
+            expand_level=expand_level,
+            limit_groups=limit_groups,
+            limit_evidence_per_group=limit_evidence_per_group,
+            include_low_confidence=include_low_confidence,
+        )
+    except (ValueError, SearchError) as e:
+        return {"error": str(e)}
+
+    if sanitized_query and sanitized_query["was_sanitized"]:
+        result["query_sanitized"] = True
+        result["sanitizer"] = {
+            "method": sanitized_query["method"],
+            "original_length": sanitized_query["original_length"],
+            "clean_length": sanitized_query["clean_length"],
+            "clean_query": sanitized_query["clean_query"],
+        }
     return result
 
 
@@ -1372,6 +1447,67 @@ TOOLS = {
             "required": ["query"],
         },
         "handler": tool_search,
+    },
+    "mempalace_search_events": {
+        "description": "Search by real event time instead of filed_at. Returns grouped event overviews, and can expand to grouped details or evidence snippets.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "time_from": {
+                    "type": "string",
+                    "description": "Inclusive start boundary (YYYY-MM-DD or ISO datetime)",
+                },
+                "time_to": {
+                    "type": "string",
+                    "description": "Exclusive end boundary (YYYY-MM-DD or ISO datetime)",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Optional topic query within the time range",
+                },
+                "wing": {"type": "string", "description": "Filter by wing (optional)"},
+                "rooms": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional room filters",
+                },
+                "record_kinds": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Record kinds to include (default transcript,memory)",
+                },
+                "agents": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional added_by / agent filters",
+                },
+                "group_by": {
+                    "type": "string",
+                    "description": "task | session | source_file | day",
+                },
+                "expand_level": {
+                    "type": "string",
+                    "description": "overview | grouped | evidence",
+                },
+                "limit_groups": {
+                    "type": "integer",
+                    "description": "Max groups to return (default 10)",
+                    "minimum": 1,
+                    "maximum": 100,
+                },
+                "limit_evidence_per_group": {
+                    "type": "integer",
+                    "description": "Max evidence records when expand_level=evidence",
+                    "minimum": 1,
+                    "maximum": 100,
+                },
+                "include_low_confidence": {
+                    "type": "boolean",
+                    "description": "Whether to include records with low-confidence timestamps",
+                },
+            },
+        },
+        "handler": tool_search_events,
     },
     "mempalace_check_duplicate": {
         "description": "Check if content already exists in the palace before filing",

@@ -14,6 +14,7 @@ Commands:
     mempalace mine <dir>                  Mine project files (default)
     mempalace mine <dir> --mode convos    Mine conversation exports
     mempalace search "query"              Find anything, exact words
+    mempalace search-events               Find events by real event time
     mempalace mcp                         Show MCP setup command
     mempalace wake-up                     Show L0 + L1 wake-up context
     mempalace wake-up --wing my_app       Wake-up for a specific project
@@ -25,6 +26,7 @@ Examples:
     mempalace mine ~/chats/claude-sessions --mode convos
     mempalace search "why did we switch to GraphQL"
     mempalace search "pricing discussion" --wing my_app --room costs
+    mempalace search-events --time-from 2026-04-01 --time-to 2026-04-08
 """
 
 import os
@@ -158,6 +160,33 @@ def cmd_search(args):
             n_results=args.results,
         )
     except SearchError:
+        sys.exit(1)
+
+
+def cmd_search_events(args):
+    from .event_search import print_event_search, search_events
+    from .searcher import SearchError
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    try:
+        result = search_events(
+            palace_path=palace_path,
+            time_from=args.time_from,
+            time_to=args.time_to,
+            query=args.query,
+            wing=args.wing,
+            rooms=args.room,
+            record_kinds=args.record_kind,
+            agents=args.agent_filter,
+            group_by=args.group_by,
+            expand_level=args.expand_level,
+            limit_groups=args.limit_groups,
+            limit_evidence_per_group=args.limit_evidence_per_group,
+            include_low_confidence=args.include_low_confidence,
+        )
+        print_event_search(result)
+    except (ValueError, SearchError) as exc:
+        print(f"\n  Event search error: {exc}")
         sys.exit(1)
 
 
@@ -546,6 +575,57 @@ def main():
     p_search.add_argument("--room", default=None, help="Limit to one room")
     p_search.add_argument("--results", type=int, default=5, help="Number of results")
 
+    p_search_events = sub.add_parser(
+        "search-events",
+        help="Find grouped events by real event time (event_at / event_time_start / event_time_end)",
+    )
+    p_search_events.add_argument("--time-from", default=None, help="Inclusive start (YYYY-MM-DD or ISO datetime)")
+    p_search_events.add_argument("--time-to", default=None, help="Exclusive end (YYYY-MM-DD or ISO datetime)")
+    p_search_events.add_argument("--query", default=None, help="Optional topic query within the time range")
+    p_search_events.add_argument("--wing", default=None, help="Limit to one wing")
+    p_search_events.add_argument(
+        "--room",
+        action="append",
+        default=[],
+        help="Limit to one room; repeat or pass comma-separated values",
+    )
+    p_search_events.add_argument(
+        "--record-kind",
+        action="append",
+        default=[],
+        help="Filter record kinds; repeat or pass comma-separated values (default: transcript,memory)",
+    )
+    p_search_events.add_argument(
+        "--agent-filter",
+        action="append",
+        default=[],
+        help="Filter added_by/agent values; repeat or pass comma-separated values",
+    )
+    p_search_events.add_argument(
+        "--group-by",
+        choices=["task", "session", "source_file", "day"],
+        default="task",
+        help="How to group matching records (default: task)",
+    )
+    p_search_events.add_argument(
+        "--expand-level",
+        choices=["overview", "grouped", "evidence"],
+        default="overview",
+        help="How much detail to return (default: overview)",
+    )
+    p_search_events.add_argument("--limit-groups", type=int, default=10, help="Max groups to print")
+    p_search_events.add_argument(
+        "--limit-evidence-per-group",
+        type=int,
+        default=3,
+        help="Max evidence records when expand-level=evidence",
+    )
+    p_search_events.add_argument(
+        "--include-low-confidence",
+        action="store_true",
+        help="Include records whose event time could not be resolved confidently",
+    )
+
     # compress
     p_compress = sub.add_parser(
         "compress", help="Compress drawers using AAAK Dialect (~30x reduction)"
@@ -671,6 +751,7 @@ def main():
         "mine": cmd_mine,
         "split": cmd_split,
         "search": cmd_search,
+        "search-events": cmd_search_events,
         "mcp": cmd_mcp,
         "compress": cmd_compress,
         "wake-up": cmd_wakeup,

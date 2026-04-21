@@ -15,6 +15,7 @@ from mempalace.cli import (
     cmd_mine,
     cmd_repair,
     cmd_search,
+    cmd_search_events,
     cmd_split,
     cmd_status,
     cmd_wakeup,
@@ -76,6 +77,74 @@ def test_cmd_search_error_exits(mock_config_cls):
     with patch("mempalace.searcher.search", side_effect=SearchError("fail")):
         with pytest.raises(SystemExit) as exc_info:
             cmd_search(args)
+        assert exc_info.value.code == 1
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_search_events_calls_search_events(mock_config_cls):
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(
+        palace=None,
+        time_from="2026-04-18",
+        time_to="2026-04-20",
+        query="mcp",
+        wing="project",
+        room=["backend,planning"],
+        record_kind=["transcript,memory"],
+        agent_filter=["codex"],
+        group_by="task",
+        expand_level="overview",
+        limit_groups=5,
+        limit_evidence_per_group=2,
+        include_low_confidence=False,
+    )
+    with (
+        patch(
+            "mempalace.event_search.search_events",
+            return_value={"groups": [], "time_range": {}, "stats": {}},
+        ) as mock_search_events,
+        patch("mempalace.event_search.print_event_search") as mock_print,
+    ):
+        cmd_search_events(args)
+        mock_search_events.assert_called_once_with(
+            palace_path="/fake/palace",
+            time_from="2026-04-18",
+            time_to="2026-04-20",
+            query="mcp",
+            wing="project",
+            rooms=["backend,planning"],
+            record_kinds=["transcript,memory"],
+            agents=["codex"],
+            group_by="task",
+            expand_level="overview",
+            limit_groups=5,
+            limit_evidence_per_group=2,
+            include_low_confidence=False,
+        )
+        mock_print.assert_called_once()
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_search_events_error_exits(mock_config_cls):
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(
+        palace=None,
+        time_from="2026-04-20",
+        time_to="2026-04-19",
+        query=None,
+        wing=None,
+        room=[],
+        record_kind=[],
+        agent_filter=[],
+        group_by="task",
+        expand_level="overview",
+        limit_groups=5,
+        limit_evidence_per_group=2,
+        include_low_confidence=False,
+    )
+    with patch("mempalace.event_search.search_events", side_effect=ValueError("bad range")):
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_search_events(args)
         assert exc_info.value.code == 1
 
 
@@ -286,6 +355,15 @@ def test_main_search_dispatches():
     with (
         patch("sys.argv", ["mempalace", "search", "my query"]),
         patch("mempalace.cli.cmd_search") as mock_cmd,
+    ):
+        main()
+        mock_cmd.assert_called_once()
+
+
+def test_main_search_events_dispatches():
+    with (
+        patch("sys.argv", ["mempalace", "search-events", "--time-from", "2026-04-20"]),
+        patch("mempalace.cli.cmd_search_events") as mock_cmd,
     ):
         main()
         mock_cmd.assert_called_once()
