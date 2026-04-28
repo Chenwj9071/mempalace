@@ -14,6 +14,7 @@ from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 import re
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .event_index import (
     get_source_db_mtime,
@@ -184,6 +185,12 @@ _NEXT_STEP_KEYWORDS = (
 )
 
 
+_SESSION_ID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE)
+_FIXED_TIMEZONE_FALLBACKS = {
+    "Asia/Shanghai": timezone(timedelta(hours=8), "Asia/Shanghai"),
+}
+
+
 def _parse_list(values) -> list[str]:
     if values is None:
         return []
@@ -219,7 +226,46 @@ def _parse_iso_timestamp(value) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _parse_time_boundary(value: str | None, is_end: bool) -> datetime | None:
+def _resolve_query_timezone(timezone_name: str | None) -> tuple[timezone | ZoneInfo, str]:
+    if not timezone_name:
+        local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+        label = getattr(local_tz, "key", None) or local_tz.tzname(None) or "local"
+        return local_tz, label
+    if timezone_name.upper() == "UTC":
+        return timezone.utc, "UTC"
+    if re.fullmatch(r"[+-]\d{2}:\d{2}", timezone_name):
+        sign = 1 if timezone_name[0] == "+" else -1
+        hours = int(timezone_name[1:3])
+        minutes = int(timezone_name[4:6])
+        offset = timedelta(hours=hours, minutes=minutes) * sign
+        return timezone(offset, timezone_name), timezone_name
+    try:
+        return ZoneInfo(timezone_name), timezone_name
+    except ZoneInfoNotFoundError:
+        fallback = _FIXED_TIMEZONE_FALLBACKS.get(timezone_name)
+        if fallback is not None:
+            return fallback, timezone_name
+        raise ValueError(f"Unknown timezone: {timezone_name}") from None
+
+
+def _parse_user_timestamp(value: str, query_timezone: timezone | ZoneInfo) -> datetime | None:
+    raw = value.strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=query_timezone)
+    return parsed.astimezone(timezone.utc)
+
+
+def _parse_time_boundary(
+    value: str | None, is_end: bool, query_timezone: timezone | ZoneInfo
+) -> datetime | None:
     if not value:
         return None
     value = value.strip()
@@ -227,16 +273,31 @@ def _parse_time_boundary(value: str | None, is_end: bool) -> datetime | None:
         day = date.fromisoformat(value)
         if is_end:
             day = day + timedelta(days=1)
-        return datetime.combine(day, time.min, tzinfo=timezone.utc)
-    return _parse_iso_timestamp(value)
+        return datetime.combine(day, time.min, tzinfo=query_timezone).astimezone(timezone.utc)
+    return _parse_user_timestamp(value, query_timezone)
 
 
-def _normalize_time_range(time_from: str | None, time_to: str | None) -> tuple[datetime | None, datetime | None]:
-    start = _parse_time_boundary(time_from, is_end=False)
-    end = _parse_time_boundary(time_to, is_end=True)
+def _normalize_time_range(
+    time_from: str | None,
+    time_to: str | None,
+    query_timezone: timezone | ZoneInfo,
+) -> tuple[datetime | None, datetime | None]:
+    start = _parse_time_boundary(time_from, is_end=False, query_timezone=query_timezone)
+    end = _parse_time_boundary(time_to, is_end=True, query_timezone=query_timezone)
     if start and end and start >= end:
         raise ValueError("time_from must be earlier than time_to")
     return start, end
+
+
+def _extract_session_ids(value: str | None) -> list[str]:
+    if not value:
+        return []
+    session_ids: list[str] = []
+    for match in _SESSION_ID_RE.finditer(value):
+        session_id = match.group(0).lower()
+        if session_id not in session_ids:
+            session_ids.append(session_id)
+    return session_ids
 
 
 def _coerce_confidence(meta: dict, has_event_fields: bool) -> tuple[str, str | None]:
@@ -557,6 +618,7 @@ def _build_record(
     rooms: list[str],
     record_kinds: list[str],
     agents: list[str],
+    session_ids: list[str],
     include_low_confidence: bool,
 ) -> dict | None:
     metadata = metadata or {}
@@ -573,6 +635,10 @@ def _build_record(
 
     added_by = metadata.get("added_by") or metadata.get("agent")
     if agents and added_by not in agents:
+        return None
+
+    source_session_id = metadata.get("source_session_id")
+    if session_ids and (not source_session_id or source_session_id.lower() not in session_ids):
         return None
 
     resolved = _resolve_event_window(metadata)
@@ -648,6 +714,7 @@ def _iter_records_by_ids(
     rooms: list[str],
     record_kinds: list[str],
     agents: list[str],
+    session_ids: list[str],
     include_low_confidence: bool,
 ):
     for start in range(0, len(drawer_ids), _BATCH_SIZE):
@@ -667,6 +734,7 @@ def _iter_records_by_ids(
                 rooms=rooms,
                 record_kinds=record_kinds,
                 agents=agents,
+                session_ids=session_ids,
                 include_low_confidence=include_low_confidence,
             )
             if record is not None:
@@ -681,6 +749,7 @@ def _iter_filtered_records(
     rooms: list[str],
     record_kinds: list[str],
     agents: list[str],
+    session_ids: list[str],
     include_low_confidence: bool,
     collection=None,
 ):
@@ -710,6 +779,7 @@ def _iter_filtered_records(
                 rooms=rooms,
                 record_kinds=record_kinds,
                 agents=agents,
+                session_ids=session_ids,
                 include_low_confidence=include_low_confidence,
             )
             if record is not None:
@@ -726,6 +796,8 @@ def search_events(
     rooms=None,
     record_kinds=None,
     agents=None,
+    session_ids=None,
+    timezone_name: str | None = None,
     group_by: str = "task",
     expand_level: str = "overview",
     limit_groups: int = 10,
@@ -740,11 +812,17 @@ def search_events(
     parsed_rooms = _parse_list(rooms)
     parsed_record_kinds = _parse_list(record_kinds) or list(_DEFAULT_RECORD_KINDS)
     parsed_agents = _parse_list(agents)
-    parsed_time_from, parsed_time_to = _normalize_time_range(time_from, time_to)
+    parsed_session_ids = [session_id.lower() for session_id in _parse_list(session_ids)]
+    query_timezone, resolved_timezone_name = _resolve_query_timezone(timezone_name)
+    parsed_time_from, parsed_time_to = _normalize_time_range(time_from, time_to, query_timezone)
 
     raw_query = (query or "").strip()
     query_info = sanitize_query(raw_query) if raw_query else None
     clean_query = query_info["clean_query"] if query_info else ""
+    inferred_session_ids = _extract_session_ids(clean_query)
+    for session_id in inferred_session_ids:
+        if session_id not in parsed_session_ids:
+            parsed_session_ids.append(session_id)
     preferred_terms = set(_meaningful_task_tokens(clean_query))
     try:
         collection = get_collection(palace_path, create=False)
@@ -767,6 +845,7 @@ def search_events(
             rooms=parsed_rooms,
             record_kinds=parsed_record_kinds,
             agents=parsed_agents,
+            session_ids=parsed_session_ids,
             include_low_confidence=include_low_confidence,
         )
         candidate_records = len(candidate_ids)
@@ -780,6 +859,7 @@ def search_events(
                 rooms=parsed_rooms,
                 record_kinds=parsed_record_kinds,
                 agents=parsed_agents,
+                session_ids=parsed_session_ids,
                 include_low_confidence=include_low_confidence,
             )
         )
@@ -794,6 +874,7 @@ def search_events(
                 rooms=parsed_rooms,
                 record_kinds=parsed_record_kinds,
                 agents=parsed_agents,
+                session_ids=parsed_session_ids,
                 include_low_confidence=include_low_confidence,
                 collection=collection,
             )
@@ -833,6 +914,8 @@ def search_events(
             "rooms": parsed_rooms,
             "record_kinds": parsed_record_kinds,
             "agents": parsed_agents,
+            "session_ids": parsed_session_ids,
+            "timezone": resolved_timezone_name,
             "group_by": group_by,
             "expand_level": expand_level,
             "include_low_confidence": include_low_confidence,

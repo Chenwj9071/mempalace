@@ -178,6 +178,8 @@ def cmd_search_events(args):
             rooms=args.room,
             record_kinds=args.record_kind,
             agents=args.agent_filter,
+            session_ids=args.session_id,
+            timezone_name=args.timezone,
             group_by=args.group_by,
             expand_level=args.expand_level,
             limit_groups=args.limit_groups,
@@ -581,6 +583,11 @@ def main():
     )
     p_search_events.add_argument("--time-from", default=None, help="Inclusive start (YYYY-MM-DD or ISO datetime)")
     p_search_events.add_argument("--time-to", default=None, help="Exclusive end (YYYY-MM-DD or ISO datetime)")
+    p_search_events.add_argument(
+        "--timezone",
+        default=None,
+        help="Timezone for date-only or naive datetime boundaries (default: local system timezone)",
+    )
     p_search_events.add_argument("--query", default=None, help="Optional topic query within the time range")
     p_search_events.add_argument("--wing", default=None, help="Limit to one wing")
     p_search_events.add_argument(
@@ -600,6 +607,12 @@ def main():
         action="append",
         default=[],
         help="Filter added_by/agent values; repeat or pass comma-separated values",
+    )
+    p_search_events.add_argument(
+        "--session-id",
+        action="append",
+        default=[],
+        help="Filter exact source_session_id; repeat or pass comma-separated values",
     )
     p_search_events.add_argument(
         "--group-by",

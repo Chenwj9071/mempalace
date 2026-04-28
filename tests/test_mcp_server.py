@@ -378,6 +378,28 @@ class TestSearchTool:
         result = mcp_server.tool_search_events(time_from="2026-04-20", rooms=["../backend"])
         assert "error" in result
 
+    def test_search_events_accepts_timezone_and_session_ids(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        captured = {}
+
+        def fake_search_events(**kwargs):
+            captured.update(kwargs)
+            return {"groups": [], "time_range": {}, "stats": {}}
+
+        monkeypatch.setattr(mcp_server, "search_events", fake_search_events)
+        result = mcp_server.tool_search_events(
+            time_from="2026-04-27",
+            time_to="2026-04-27",
+            timezone="Asia/Shanghai",
+            session_ids=["019dba1e-2268-7261-aeff-0f346f95d745"],
+        )
+
+        assert "error" not in result
+        assert captured["timezone_name"] == "Asia/Shanghai"
+        assert captured["session_ids"] == ["019dba1e-2268-7261-aeff-0f346f95d745"]
+
     def test_search_min_similarity_backwards_compat(
         self, monkeypatch, config, palace_path, seeded_collection, kg
     ):

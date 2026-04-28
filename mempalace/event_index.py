@@ -68,6 +68,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             ON event_entries(record_kind);
         CREATE INDEX IF NOT EXISTS idx_event_entries_added_by
             ON event_entries(added_by);
+        CREATE INDEX IF NOT EXISTS idx_event_entries_source_session_id
+            ON event_entries(source_session_id);
         CREATE INDEX IF NOT EXISTS idx_event_entries_task_hint
             ON event_entries(task_hint);
         """
@@ -164,6 +166,7 @@ def query_event_index(
     rooms: list[str],
     record_kinds: list[str],
     agents: list[str],
+    session_ids: list[str],
     include_low_confidence: bool,
 ) -> list[str]:
     index_path = get_event_index_path(palace_path)
@@ -185,6 +188,9 @@ def query_event_index(
     if agents:
         conditions.append(f"added_by IN ({', '.join('?' for _ in agents)})")
         params.extend(agents)
+    if session_ids:
+        conditions.append(f"source_session_id IN ({', '.join('?' for _ in session_ids)})")
+        params.extend(session_ids)
     if not include_low_confidence:
         conditions.append("confidence != 'low'")
 

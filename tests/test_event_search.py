@@ -246,6 +246,105 @@ def test_search_events_excludes_low_confidence_by_default(collection, palace_pat
     assert included_result["stats"]["matched_records"] == 1
 
 
+def test_search_events_uses_timezone_for_date_boundaries(collection, palace_path):
+    collection.add(
+        ids=["drawer_shanghai_day", "drawer_next_day"],
+        documents=[
+            "Shanghai-local 2026-04-27 work item.",
+            "Shanghai-local 2026-04-28 work item.",
+        ],
+        metadatas=[
+            {
+                "wing": "project",
+                "room": "planning",
+                "source_file": "tz-a.jsonl",
+                "source_session_id": "sess-tz-a",
+                "record_kind": "transcript",
+                "added_by": "codex",
+                "event_time_start": "2026-04-26T20:00:00+00:00",
+                "event_time_end": "2026-04-26T20:05:00+00:00",
+                "event_at": "2026-04-26T20:05:00+00:00",
+                "timestamp_source": "message_timestamp",
+            },
+            {
+                "wing": "project",
+                "room": "planning",
+                "source_file": "tz-b.jsonl",
+                "source_session_id": "sess-tz-b",
+                "record_kind": "transcript",
+                "added_by": "codex",
+                "event_time_start": "2026-04-27T16:30:00+00:00",
+                "event_time_end": "2026-04-27T16:35:00+00:00",
+                "event_at": "2026-04-27T16:35:00+00:00",
+                "timestamp_source": "message_timestamp",
+            },
+        ],
+    )
+
+    result = search_events(
+        palace_path=palace_path,
+        time_from="2026-04-27",
+        time_to="2026-04-27",
+        timezone_name="Asia/Shanghai",
+        group_by="session",
+    )
+
+    assert result["stats"]["matched_records"] == 1
+    assert result["groups"][0]["title"] == "Session sess-tz-a"
+    assert result["filters"]["timezone"] == "Asia/Shanghai"
+
+
+def test_search_events_exact_session_filter_ignores_cross_session_mentions(collection, palace_path):
+    target_session_id = "019dba1e-2268-7261-aeff-0f346f95d745"
+    collection.add(
+        ids=["drawer_target", "drawer_reference"],
+        documents=[
+            "Target session actual transcript content.",
+            f"Today we discussed session {target_session_id} in a different conversation.",
+        ],
+        metadatas=[
+            {
+                "wing": "project",
+                "room": "planning",
+                "source_file": "target.jsonl",
+                "source_session_id": target_session_id,
+                "record_kind": "transcript",
+                "added_by": "codex",
+                "event_time_start": "2026-04-27T02:00:00+00:00",
+                "event_time_end": "2026-04-27T02:05:00+00:00",
+                "event_at": "2026-04-27T02:05:00+00:00",
+                "timestamp_source": "message_timestamp",
+            },
+            {
+                "wing": "project",
+                "room": "planning",
+                "source_file": "other.jsonl",
+                "source_session_id": "other-session",
+                "record_kind": "transcript",
+                "added_by": "codex",
+                "event_time_start": "2026-04-27T03:00:00+00:00",
+                "event_time_end": "2026-04-27T03:05:00+00:00",
+                "event_at": "2026-04-27T03:05:00+00:00",
+                "timestamp_source": "message_timestamp",
+            },
+        ],
+    )
+
+    result = search_events(
+        palace_path=palace_path,
+        time_from="2026-04-27",
+        time_to="2026-04-27",
+        timezone_name="Asia/Shanghai",
+        query=target_session_id,
+        group_by="session",
+        expand_level="evidence",
+    )
+
+    assert result["stats"]["matched_records"] == 1
+    assert result["groups"][0]["title"] == f"Session {target_session_id}"
+    assert result["groups"][0]["evidence"][0]["source_session_id"] == target_session_id
+
+
 def test_print_event_search_outputs_group_summary(capsys, collection, palace_path):
     collection.add(
         ids=["drawer_print"],

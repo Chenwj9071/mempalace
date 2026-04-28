@@ -486,11 +486,13 @@ def tool_search(
 def tool_search_events(
     time_from: str = None,
     time_to: str = None,
+    timezone: str = None,
     query: str = None,
     wing: str = None,
     rooms=None,
     record_kinds=None,
     agents=None,
+    session_ids=None,
     group_by: str = "task",
     expand_level: str = "overview",
     limit_groups: int = 10,
@@ -504,6 +506,7 @@ def tool_search_events(
         rooms = _sanitize_name_list(rooms, "rooms")
         record_kinds = _sanitize_name_list(record_kinds, "record_kinds")
         agents = _sanitize_name_list(agents, "agents")
+        session_ids = _sanitize_name_list(session_ids, "session_ids")
     except ValueError as e:
         return {"error": str(e)}
 
@@ -514,11 +517,13 @@ def tool_search_events(
             palace_path=_config.palace_path,
             time_from=time_from,
             time_to=time_to,
+            timezone_name=timezone,
             query=clean_query,
             wing=wing,
             rooms=rooms,
             record_kinds=record_kinds,
             agents=agents,
+            session_ids=session_ids,
             group_by=group_by,
             expand_level=expand_level,
             limit_groups=limit_groups,
@@ -1461,6 +1466,10 @@ TOOLS = {
                     "type": "string",
                     "description": "Exclusive end boundary (YYYY-MM-DD or ISO datetime)",
                 },
+                "timezone": {
+                    "type": "string",
+                    "description": "Timezone for date-only or naive datetime boundaries (default: local system timezone)",
+                },
                 "query": {
                     "type": "string",
                     "description": "Optional topic query within the time range",
@@ -1480,6 +1489,11 @@ TOOLS = {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Optional added_by / agent filters",
+                },
+                "session_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Exact source_session_id filters",
                 },
                 "group_by": {
                     "type": "string",
