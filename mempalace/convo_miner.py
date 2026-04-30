@@ -457,6 +457,22 @@ def _registry_matches_file(registry_meta: dict, file_state: dict, transcript_dig
     )
 
 
+def _registry_matches_file_fast(registry_meta: dict, file_state: dict) -> bool:
+    """Cheap skip check before normalization.
+
+    The registry already stores size + modified timestamp, which is enough to
+    tell whether an append-only transcript changed in the common case.
+    """
+    if not registry_meta:
+        return False
+    if _safe_int(registry_meta.get("normalize_version"), 0) < CONVO_NORMALIZE_VERSION:
+        return False
+    return (
+        _safe_int(registry_meta.get("source_size"), -1) == _safe_int(file_state.get("source_size"), -2)
+        and registry_meta.get("source_modified_at") == file_state.get("source_modified_at")
+    )
+
+
 def _plan_exchange_update(registry_meta: dict, drawers: list, messages: list, transcript_digest: str, file_state: dict):
     if registry_meta is None:
         return {"mode": "full", "rewind_from": 0}
@@ -653,6 +669,47 @@ def mine_convos(
         source_file = str(filepath)
         file_state = _get_file_state(filepath)
 
+        if dry_run:
+            try:
+                normalized_data = normalize_with_metadata(source_file)
+            except (OSError, ValueError):
+                normalized_data = {
+                    "transcript": "",
+                    "messages": [],
+                    "source_format": "error",
+                    "session_id": None,
+                }
+            transcript = normalized_data.get("transcript", "")
+            transcript_room = detect_convo_room(transcript) if transcript else "general"
+            transcript_chunks = []
+            memory_chunks = []
+            if transcript and len(transcript.strip()) >= MIN_CHUNK_SIZE:
+                transcript_chunks = _prepare_transcript_chunks(
+                    normalized_data,
+                    file_state,
+                    room=transcript_room,
+                    extract_mode=extract_mode,
+                )
+                if extract_mode == "general":
+                    memory_chunks = _prepare_memory_chunks(normalized_data, file_state, len(transcript_chunks))
+            planned_chunks = transcript_chunks + memory_chunks
+
+            if planned_chunks:
+                print(f"    [DRY RUN] {filepath.name} -> {len(planned_chunks)} drawers")
+                for chunk in planned_chunks:
+                    room_counts[chunk["room"]] += 1
+                total_drawers += len(planned_chunks)
+            else:
+                print(f"    [DRY RUN] {filepath.name} -> registry only")
+            continue
+
+        with mine_lock(source_file):
+            registry, existing_drawers = _load_source_state(collection, source_file)
+            registry_meta = registry["metadata"] if registry else None
+            if _registry_matches_file_fast(registry_meta, file_state):
+                files_skipped += 1
+                continue
+
         try:
             normalized_data = normalize_with_metadata(source_file)
         except (OSError, ValueError):
@@ -681,90 +738,77 @@ def mine_convos(
 
         planned_chunks = transcript_chunks + memory_chunks
 
-        if dry_run:
-            if planned_chunks:
-                print(f"    [DRY RUN] {filepath.name} -> {len(planned_chunks)} drawers")
-                for chunk in planned_chunks:
-                    room_counts[chunk["room"]] += 1
-                total_drawers += len(planned_chunks)
-            else:
-                print(f"    [DRY RUN] {filepath.name} -> registry only")
+        surviving_drawers = []
+
+        if _registry_matches_file(registry_meta, file_state, transcript_digest):
+            files_skipped += 1
             continue
 
-        with mine_lock(source_file):
-            registry, existing_drawers = _load_source_state(collection, source_file)
-            registry_meta = registry["metadata"] if registry else None
-            surviving_drawers = []
-
-            if _registry_matches_file(registry_meta, file_state, transcript_digest):
-                files_skipped += 1
-                continue
-
-            if extract_mode == "general":
-                plan = {"mode": "full", "rewind_from": 0}
-            else:
-                plan = _plan_exchange_update(
-                    registry_meta,
-                    existing_drawers,
-                    normalized_data.get("messages", []) or [],
-                    transcript_digest,
-                    file_state,
-                )
-
-            if plan["mode"] == "noop":
-                files_skipped += 1
-                continue
-
-            if plan["mode"] == "full":
-                _delete_source(collection, source_file)
-                chunks_to_write = planned_chunks
-            else:
-                overlap_start = plan["rewind_from"]
-                _delete_tail_drawers(collection, existing_drawers, overlap_start)
-                surviving_drawers = [
-                    drawer
-                    for drawer in existing_drawers
-                    if _safe_int((drawer.get("metadata") or {}).get("source_message_end_idx"), -1) < overlap_start
-                ]
-                chunk_index_base = _last_chunk_index(surviving_drawers) + 1
-                partial_messages = [
-                    message
-                    for message in normalized_data.get("messages", []) or []
-                    if _safe_int(message.get("seq"), -1) >= overlap_start
-                ]
-                chunks_to_write = _prepare_transcript_chunks(
-                    normalized_data,
-                    file_state,
-                    room=transcript_room,
-                    extract_mode=extract_mode,
-                    chunk_index_base=chunk_index_base,
-                    messages_override=partial_messages,
-                )
-
-            if chunks_to_write:
-                _upsert_chunks(collection, chunks_to_write, wing, agent, source_file, file_state, normalized_data)
-                for chunk in chunks_to_write:
-                    room_counts[chunk["room"]] += 1
-            else:
-                _delete_source(collection, source_file)
-
-            registry_metadata = _build_registry_metadata(
-                source_file=source_file,
-                wing=wing,
-                agent=agent,
-                file_state=file_state,
-                normalized_data=normalized_data,
-                transcript_digest=transcript_digest,
-                last_chunk_index=max(
-                    _last_chunk_index(surviving_drawers),
-                    _last_chunk_index([{"metadata": {"chunk_index": chunk["chunk_index"]}} for chunk in chunks_to_write]),
-                ),
-                extract_mode=extract_mode,
+        if extract_mode == "general":
+            plan = {"mode": "full", "rewind_from": 0}
+        else:
+            plan = _plan_exchange_update(
+                registry_meta,
+                existing_drawers,
+                normalized_data.get("messages", []) or [],
+                transcript_digest,
+                file_state,
             )
-            _upsert_registry(collection, registry_metadata)
 
-            total_drawers += len(chunks_to_write)
-            print(f"  + [{index:4}/{len(files)}] {filepath.name[:50]:50} {len(chunks_to_write)}")
+        if plan["mode"] == "noop":
+            files_skipped += 1
+            continue
+
+        if plan["mode"] == "full":
+            _delete_source(collection, source_file)
+            chunks_to_write = planned_chunks
+        else:
+            overlap_start = plan["rewind_from"]
+            _delete_tail_drawers(collection, existing_drawers, overlap_start)
+            surviving_drawers = [
+                drawer
+                for drawer in existing_drawers
+                if _safe_int((drawer.get("metadata") or {}).get("source_message_end_idx"), -1) < overlap_start
+            ]
+            chunk_index_base = _last_chunk_index(surviving_drawers) + 1
+            partial_messages = [
+                message
+                for message in normalized_data.get("messages", []) or []
+                if _safe_int(message.get("seq"), -1) >= overlap_start
+            ]
+            chunks_to_write = _prepare_transcript_chunks(
+                normalized_data,
+                file_state,
+                room=transcript_room,
+                extract_mode=extract_mode,
+                chunk_index_base=chunk_index_base,
+                messages_override=partial_messages,
+            )
+
+        if chunks_to_write:
+            _upsert_chunks(collection, chunks_to_write, wing, agent, source_file, file_state, normalized_data)
+            for chunk in chunks_to_write:
+                room_counts[chunk["room"]] += 1
+        else:
+            _delete_source(collection, source_file)
+
+        registry_metadata = _build_registry_metadata(
+            source_file=source_file,
+            wing=wing,
+            agent=agent,
+            file_state=file_state,
+            normalized_data=normalized_data,
+            transcript_digest=transcript_digest,
+            last_chunk_index=max(
+                _last_chunk_index(surviving_drawers),
+                _last_chunk_index([{"metadata": {"chunk_index": chunk["chunk_index"]}} for chunk in chunks_to_write]),
+            ),
+            extract_mode=extract_mode,
+        )
+        _upsert_registry(collection, registry_metadata)
+
+        total_drawers += len(chunks_to_write)
+        print(f"  + [{index:4}/{len(files)}] {filepath.name[:50]:50} {len(chunks_to_write)}")
 
     print(f"\n{'=' * 55}")
     print("  Done.")
