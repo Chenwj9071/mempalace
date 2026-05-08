@@ -50,6 +50,24 @@ READABLE_EXTENSIONS = {
     ".toml",
 }
 
+
+def _fetch_all_metadata(col, where=None, batch_size: int = 1000):
+    """Paginate metadata reads to avoid SQLite/Chroma variable limits."""
+    total = col.count()
+    all_meta = []
+    offset = 0
+    while offset < total:
+        kwargs = {"include": ["metadatas"], "limit": batch_size, "offset": offset}
+        if where:
+            kwargs["where"] = where
+        batch = col.get(**kwargs)
+        metadatas = batch.get("metadatas") or []
+        if not metadatas:
+            break
+        all_meta.extend(metadatas)
+        offset += len(metadatas)
+    return all_meta
+
 SKIP_FILENAMES = {
     "mempalace.yaml",
     "mempalace.yml",
@@ -840,9 +858,7 @@ def status(palace_path: str):
         return
 
     # Count by wing and room
-    total = col.count()
-    r = col.get(limit=total, include=["metadatas"]) if total else {"metadatas": []}
-    metas = r["metadatas"]
+    metas = _fetch_all_metadata(col)
 
     wing_rooms = defaultdict(lambda: defaultdict(int))
     for m in metas:
