@@ -1833,22 +1833,81 @@ def _restore_stdout():
     sys.stdout = _REAL_STDOUT
 
 
+def _read_request_message():
+    """Read one MCP/JSON-RPC message from stdin.
+
+    Supports both standard MCP stdio framing (Content-Length headers) and
+    the legacy newline-delimited JSON format used by older MemPalace docs.
+    Returns (request_dict, transport_name) or (None, None) on EOF.
+    """
+    stdin_buffer = getattr(sys.stdin, "buffer", None)
+    if stdin_buffer is None:
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                return None, None
+            line = line.strip()
+            if line:
+                return json.loads(line), "line"
+
+    while True:
+        first_line = stdin_buffer.readline()
+        if not first_line:
+            return None, None
+
+        stripped = first_line.strip()
+        if not stripped:
+            continue
+
+        if stripped.lower().startswith(b"content-length:"):
+            try:
+                content_length = int(stripped.split(b":", 1)[1].strip())
+            except (IndexError, ValueError) as e:
+                raise ValueError("Invalid Content-Length header") from e
+
+            while True:
+                header_line = stdin_buffer.readline()
+                if not header_line:
+                    return None, None
+                if header_line in (b"\r\n", b"\n"):
+                    break
+
+            body = stdin_buffer.read(content_length)
+            if len(body) < content_length:
+                return None, None
+            return json.loads(body.decode("utf-8")), "framed"
+
+        return json.loads(stripped.decode("utf-8")), "line"
+
+
+def _write_response_message(response, transport: str):
+    """Write one JSON-RPC response using the negotiated transport."""
+    payload = json.dumps(response)
+
+    if transport == "framed":
+        encoded = payload.encode("utf-8")
+        stdout_buffer = getattr(sys.stdout, "buffer", None)
+        if stdout_buffer is not None:
+            stdout_buffer.write(f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii"))
+            stdout_buffer.write(encoded)
+            stdout_buffer.flush()
+            return
+
+    sys.stdout.write(payload + "\n")
+    sys.stdout.flush()
+
+
 def main():
     _restore_stdout()
     logger.info("MemPalace MCP Server starting...")
     while True:
         try:
-            line = sys.stdin.readline()
-            if not line:
+            request, transport = _read_request_message()
+            if request is None:
                 break
-            line = line.strip()
-            if not line:
-                continue
-            request = json.loads(line)
             response = handle_request(request)
             if response is not None:
-                sys.stdout.write(json.dumps(response) + "\n")
-                sys.stdout.flush()
+                _write_response_message(response, transport)
         except KeyboardInterrupt:
             break
         except Exception as e:

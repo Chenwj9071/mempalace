@@ -13,6 +13,7 @@ stdout in main() before entering the protocol loop.
 import subprocess
 import sys
 import textwrap
+import json
 
 
 def test_module_import_redirects_stdout_to_stderr():
@@ -81,3 +82,58 @@ def test_mcp_server_no_stdout_noise_on_clean_exit():
     assert (
         proc.stdout == b""
     ), f"stdout must be empty before the first JSON-RPC response, but got: {proc.stdout!r}"
+
+
+def test_mcp_server_accepts_content_length_framing():
+    """Standard MCP stdio framing must complete initialize successfully."""
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "pytest", "version": "1.0"},
+        },
+    }
+    body = json.dumps(request).encode("utf-8")
+    payload = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "mempalace.mcp_server"],
+        input=payload,
+        capture_output=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", errors="replace")
+    assert proc.stdout.startswith(b"Content-Length: "), proc.stdout
+    header_block, response_body = proc.stdout.split(b"\r\n\r\n", 1)
+    content_length = int(header_block.decode("ascii").split(": ", 1)[1])
+    assert len(response_body) == content_length
+    response = json.loads(response_body.decode("utf-8"))
+    assert response["id"] == 1
+    assert response["result"]["serverInfo"]["name"] == "mempalace"
+
+
+def test_mcp_server_keeps_legacy_line_json_compatibility():
+    """Older newline-delimited JSON clients should keep working."""
+    request = {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "initialize",
+        "params": {"protocolVersion": "2025-03-26"},
+    }
+    payload = (json.dumps(request) + "\n").encode("utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "mempalace.mcp_server"],
+        input=payload,
+        capture_output=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", errors="replace")
+    response = json.loads(proc.stdout.decode("utf-8").strip())
+    assert response["id"] == 7
+    assert response["result"]["protocolVersion"] == "2025-03-26"
